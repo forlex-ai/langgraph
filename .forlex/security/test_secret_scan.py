@@ -2,14 +2,18 @@
 
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import secrets
 import string
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 def gate():
@@ -141,6 +145,35 @@ class GateTests(unittest.TestCase):
                 )
                 with self.assertRaises(ValueError):
                     gate().read_policy(policy)
+
+    def test_validate_policy_cli_uses_strict_policy_and_redacts_rejections(self):
+        """Validate the actual candidate policy without publishing rejected field values."""
+        secret = "sensitive-policy-authority"
+        rule = exception(finding())
+        invalid = (
+            "{",
+            '{"version":1,"version":1,"exceptions":[]}',
+            json.dumps({"version": 2, "exceptions": []}),
+            json.dumps({"version": 1, "exceptions": [{**rule, "owner": secret}]}),
+            json.dumps({"version": 1, "exceptions": [rule, rule]}),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            policy = Path(directory) / "policy.json"
+            command = [
+                sys.executable,
+                str(Path(__file__).with_name("secret_scan.py")),
+                "validate-policy",
+                "--policy",
+                str(policy),
+            ]
+            for body in invalid:
+                with self.subTest(body=body):
+                    policy.write_text(body)
+                    result = subprocess.run(command, capture_output=True, text=True, check=False)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertNotIn(secret, result.stdout + result.stderr)
+            policy.write_text(json.dumps({"version": 1, "exceptions": [rule]}))
+            self.assertEqual(subprocess.run(command, capture_output=True, check=False).returncode, 0)
 
     def test_scanner_error_and_invalid_output_fail_and_never_expose_output(self):
         """Verify scanner error and invalid output fail and never expose output."""
@@ -304,7 +337,7 @@ class GateTests(unittest.TestCase):
             calls.append((method, suffix))
             if suffix.startswith("pulls/"):
                 return {"state": "open", "head": {"sha": "c" * 40}, "base": {"sha": source["base"]}}
-            return {"head_sha": source["head"], "name": "TruffleHog secret scan", "app": {"id": 46505}}
+            return {"id": 3, "head_sha": source["head"], "name": "TruffleHog secret scan", "app": {"id": 46505}}
 
         module.github = api
         with self.assertRaises(ValueError):
@@ -315,15 +348,149 @@ class GateTests(unittest.TestCase):
             module.publish(source, report)
         self.assertFalse(any(method == "PATCH" for method, _ in calls))
 
+    def test_original_check_identity_mismatch_never_patches(self):
+        """Reject checks with a different original identity or publishing app."""
+        source = {"repository": "forlex-ai/unit", "pr": 1, "head": "a" * 40, "base": "b" * 40, "check_id": 3}
+        report = {**source, "version": 1, "result": "pass", "blocked": 0, "suppressed": 0, "commit_count": 2}
+        owned = {"id": 3, "head_sha": source["head"], "name": "TruffleHog secret scan", "app": {"id": 15368}}
+        for mismatched in (
+            {**owned, "id": 4},
+            {**owned, "head_sha": "c" * 40},
+            {**owned, "name": "Other check"},
+            {**owned, "app": {"id": 46505}},
+        ):
+            with self.subTest(mismatched=mismatched):
+                module = gate()
+                calls = []
+
+                def api(
+                    repository, suffix, *, method="GET", body=None, calls=calls, mismatched=mismatched, module=module
+                ):
+                    calls.append((method, suffix))
+                    if suffix.startswith("pulls/"):
+                        raise module.SecretScanRefusal("private current PR error")
+                    return mismatched
+
+                module.github = api
+                with self.assertRaises(module.SecretScanRefusal):
+                    module.publish(source, report)
+                self.assertFalse(any(method == "PATCH" for method, _ in calls))
+
+    def test_changed_or_unreadable_pr_finishes_original_owned_check_as_failure(self):
+        """Close the original check safely when current PR evidence changes or is unavailable."""
+        secret = "sensitive-current-pr-read-error"
+        source = {"repository": "forlex-ai/unit", "pr": 1, "head": "a" * 40, "base": "b" * 40, "check_id": 3}
+        report = {**source, "version": 1, "result": "pass", "blocked": 0, "suppressed": 0, "commit_count": 2}
+        for changed in ("head", "base", "closed", "unreadable"):
+            with self.subTest(changed=changed):
+                module = gate()
+                calls = []
+                owned = {"id": 3, "head_sha": source["head"], "name": "TruffleHog secret scan", "app": {"id": 15368}}
+
+                def api(
+                    repository,
+                    suffix,
+                    *,
+                    method="GET",
+                    body=None,
+                    calls=calls,
+                    changed=changed,
+                    module=module,
+                    owned=owned,
+                ):
+                    calls.append((method, suffix, body))
+                    if suffix.startswith("pulls/"):
+                        if changed == "unreadable":
+                            raise module.SecretScanRefusal(secret)
+                        return {
+                            "state": "closed" if changed == "closed" else "open",
+                            "head": {"sha": "c" * 40 if changed == "head" else source["head"]},
+                            "base": {"sha": "c" * 40 if changed == "base" else source["base"]},
+                        }
+                    return {**owned, **body} if method == "PATCH" else owned
+
+                module.github = api
+                try:
+                    result = module.publish(source, report)
+                except module.SecretScanRefusal:
+                    result = {"conclusion": "refused"}
+                self.assertEqual(result["conclusion"], "failure")
+                patches = [(suffix, body) for method, suffix, body in calls if method == "PATCH"]
+                self.assertEqual(len(patches), 1)
+                self.assertEqual(patches[0][0], "check-runs/3")
+                self.assertEqual(patches[0][1]["status"], "completed")
+                self.assertNotIn(secret, json.dumps(result))
+
+    def test_check_read_and_patch_errors_refuse_without_exposing_provider_text(self):
+        """Unavailable check identity or completion must not claim a terminal result."""
+        secret = "sensitive-check-provider-error"
+        source = {"repository": "forlex-ai/unit", "pr": 1, "head": "a" * 40, "base": "b" * 40, "check_id": 3}
+        report = {**source, "version": 1, "result": "pass", "blocked": 0, "suppressed": 0, "commit_count": 2}
+        for failed in ("check-read", "patch"):
+            with self.subTest(failed=failed):
+                module = gate()
+                calls = []
+
+                def api(repository, suffix, *, method="GET", body=None, calls=calls, failed=failed, module=module):
+                    calls.append((method, suffix, body))
+                    if suffix.startswith("pulls/"):
+                        raise module.SecretScanRefusal(secret)
+                    if failed == "check-read" or method == "PATCH":
+                        raise module.SecretScanRefusal(secret)
+                    return {"id": 3, "head_sha": source["head"], "name": "TruffleHog secret scan", "app": {"id": 15368}}
+
+                module.github = api
+                with self.assertRaises(module.SecretScanRefusal) as refusal:
+                    module.publish(source, report)
+                self.assertNotIn(secret, str(refusal.exception))
+                patches = [body for method, _, body in calls if method == "PATCH"]
+                self.assertEqual(len(patches), 1 if failed == "patch" else 0)
+                self.assertTrue(all(body["conclusion"] == "failure" for body in patches))
+
+    def test_patch_response_must_confirm_original_owned_terminal_result(self):
+        """Never infer successful completion from an incomplete or contradictory API response."""
+        source = {"repository": "forlex-ai/unit", "pr": None, "head": "a" * 40, "base": None, "check_id": 3}
+        report = {**source, "version": 1, "result": "pass", "blocked": 0, "suppressed": 0, "commit_count": 2}
+        owned = {"id": 3, "head_sha": source["head"], "name": "TruffleHog secret scan", "app": {"id": 15368}}
+        for response in (
+            {**owned, "status": "completed", "conclusion": "success", "id": 4},
+            {**owned, "status": "in_progress", "conclusion": "success"},
+            {**owned, "status": "completed", "conclusion": "failure"},
+            {**owned, "status": "completed", "conclusion": "success", "head_sha": "c" * 40},
+            {**owned, "status": "completed", "conclusion": "success", "app": {"id": 46505}},
+            {},
+        ):
+            with self.subTest(response=response):
+                module = gate()
+                module.github = lambda *args, method="GET", response=response, **kwargs: (
+                    response if method == "PATCH" else owned
+                )
+                with self.assertRaises(module.SecretScanRefusal):
+                    module.publish(source, report)
+
+    def test_failed_report_counts_are_redacted_in_published_failure(self):
+        """Malformed counts cannot carry secret bytes into a terminal summary."""
+        module = gate()
+        secret = "sensitive-report-count"
+        source = {"repository": "forlex-ai/unit", "pr": None, "head": "a" * 40, "base": None, "check_id": 3}
+        owned = {"id": 3, "head_sha": source["head"], "name": "TruffleHog secret scan", "app": {"id": 15368}}
+        module.github = lambda *args, method="GET", body=None: {**owned, **body} if method == "PATCH" else owned
+        result = module.publish(
+            source, {"result": "error", "blocked": secret, "suppressed": secret, "commit_count": secret}
+        )
+        self.assertEqual(result["conclusion"], "failure")
+        self.assertNotIn(secret, json.dumps(result))
+
     def test_missing_and_inconsistent_reports_publish_failure(self):
         """Do not accept a declared pass with failed or incomplete scan counts."""
         module = gate()
         source = {"repository": "forlex-ai/unit", "pr": None, "head": "a" * 40, "base": None, "check_id": 3}
 
         def api(repository, suffix, *, method="GET", body=None):
+            owned = {"id": 3, "head_sha": source["head"], "name": "TruffleHog secret scan", "app": {"id": 15368}}
             if method == "PATCH":
-                return body
-            return {"head_sha": source["head"], "name": "TruffleHog secret scan", "app": {"id": 15368}}
+                return {**owned, **body}
+            return owned
 
         module.github = api
         for report in (
@@ -333,12 +500,180 @@ class GateTests(unittest.TestCase):
         ):
             self.assertEqual(module.publish(source, report)["conclusion"], "failure")
 
+    def test_publish_cli_unreadable_or_nonobject_report_finishes_owned_check_as_failure(self):
+        """Damaged report artifacts still terminate only the verified trusted check."""
+        secret = "sensitive-report-artifact"
+        source = {"repository": "forlex-ai/unit", "pr": 1, "head": "a" * 40, "base": "b" * 40, "check_id": 3}
+        owned = {"id": 3, "head_sha": source["head"], "name": "TruffleHog secret scan", "app": {"id": 15368}}
+        artifacts = (
+            ("malformed", '{"raw":"' + secret),
+            ("duplicate", '{"raw":"' + secret + '","raw":"duplicate"}'),
+            ("string", json.dumps(secret)),
+            ("list", json.dumps([secret])),
+            ("null", "null"),
+            ("number", "7"),
+            ("boolean", "true"),
+            ("encoding", b"\xff" + secret.encode()),
+            ("directory", None),
+            ("missing", None),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            context = root / "context.json"
+            context.write_text(json.dumps(source))
+            for kind, data in artifacts:
+                with self.subTest(kind=kind):
+                    module = gate()
+                    calls = []
+                    report = root / kind
+                    if isinstance(data, bytes):
+                        report.write_bytes(data)
+                    elif isinstance(data, str):
+                        report.write_text(data)
+                    elif kind == "directory":
+                        report.mkdir()
+
+                    def api(repository, suffix, *, method="GET", body=None, calls=calls):
+                        calls.append((method, suffix, body))
+                        if suffix.startswith("pulls/"):
+                            return {"state": "open", "head": {"sha": source["head"]}, "base": {"sha": source["base"]}}
+                        return {**owned, **body} if method == "PATCH" else owned
+
+                    module.github = api
+                    argv = ["secret_scan.py", "publish", "--context", str(context), "--report", str(report)]
+                    with (
+                        patch.object(sys, "argv", argv),
+                        patch("sys.stdout", new_callable=io.StringIO) as stdout,
+                        patch("sys.stderr", new_callable=io.StringIO) as stderr,
+                    ):
+                        self.assertEqual(module.main(), 1)
+                    self.assertEqual(
+                        [(method, suffix) for method, suffix, _ in calls],
+                        [("GET", "pulls/1"), ("GET", "check-runs/3"), ("PATCH", "check-runs/3")],
+                    )
+                    self.assertEqual(calls[-1][2]["conclusion"], "failure")
+                    self.assertEqual(calls[-1][2]["status"], "completed")
+                    self.assertNotIn(secret, stdout.getvalue() + stderr.getvalue() + json.dumps(calls))
+
+    def test_publish_cli_unreadable_context_cannot_choose_a_check(self):
+        """Refuse before API access when trusted check identity cannot be read."""
+        secret = "sensitive-context-artifact"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = root / "report.json"
+            report.write_text('{"result":"error"}')
+            for name, data in (
+                ("malformed", '{"raw":"' + secret),
+                ("nonobject", json.dumps([secret])),
+                ("missing", None),
+            ):
+                with self.subTest(name=name):
+                    module = gate()
+                    module.github = lambda *args, **kwargs: self.fail("Unverifiable context reached the API")
+                    context = root / name
+                    if data is not None:
+                        context.write_text(data)
+                    argv = ["secret_scan.py", "publish", "--context", str(context), "--report", str(report)]
+                    with (
+                        patch.object(sys, "argv", argv),
+                        patch("sys.stdout", new_callable=io.StringIO) as stdout,
+                        patch("sys.stderr", new_callable=io.StringIO) as stderr,
+                    ):
+                        self.assertEqual(module.main(), 1)
+                    self.assertNotIn(secret, stdout.getvalue() + stderr.getvalue())
+
     def test_unsupported_events_cannot_create_checks(self):
         """Allow only the explicitly supported trusted workflow events."""
         module = gate()
         module.github = lambda *args, **kwargs: self.fail("An unsupported event reached the GitHub API")
         with self.assertRaises(ValueError):
             module.context({"repository": {"full_name": "forlex-ai/unit"}}, "issue_comment", "forlex-ai/unit")
+
+    def test_tag_push_uses_native_commit_head_and_full_history_scope(self):
+        """An updated annotated tag's prior object cannot limit metadata admission."""
+        module = gate()
+        module.github = lambda *args, **kwargs: {"id": 3}
+        event = {
+            "repository": {"full_name": "forlex-ai/unit"},
+            "ref": "refs/tags/release",
+            "before": "b" * 40,
+            "after": "c" * 40,
+        }
+        with patch.dict(os.environ, {"GITHUB_SHA": "a" * 40}):
+            source = module.context(event, "push", "forlex-ai/unit")
+            self.assertEqual(source["head"], "a" * 40)
+            self.assertIsNone(source["base"])
+            self.assertEqual(source.get("tag_object"), "c" * 40)
+            self.assertEqual(source.get("tag_ref"), "refs/tags/release")
+            source = module.context({**event, "ref": "refs/heads/test"}, "push", "forlex-ai/unit")
+            self.assertEqual(source["base"], "b" * 40)
+            self.assertNotIn("tag_object", source)
+
+    def test_tag_context_cli_outputs_validated_exact_pushed_object(self):
+        """The inert checkout must receive the immutable event object, never a mutable ref."""
+        module = gate()
+        module.github = lambda *args, **kwargs: {"id": 3}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            event = root / "event.json"
+            output = root / "context.json"
+            gha_output = root / "gha-output"
+            event.write_text(
+                json.dumps(
+                    {"repository": {"full_name": "forlex-ai/unit"}, "ref": "refs/tags/release", "after": "c" * 40}
+                )
+            )
+            argv = [
+                "secret_scan.py",
+                "context",
+                "--event",
+                str(event),
+                "--kind",
+                "push",
+                "--repository",
+                "forlex-ai/unit",
+                "--output",
+                str(output),
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.dict(os.environ, {"GITHUB_SHA": "a" * 40, "GITHUB_OUTPUT": str(gha_output)}),
+            ):
+                self.assertEqual(module.main(), 0)
+            self.assertIn("tag_object=" + "c" * 40 + "\n", gha_output.read_text())
+            self.assertNotIn("refs/tags/release", gha_output.read_text())
+
+    def test_tag_report_must_bind_exact_pushed_object_and_ref_digest(self):
+        """A commit-only pass cannot stand in for the pushed tag object's scan."""
+        module = gate()
+        source = {
+            "repository": "forlex-ai/unit",
+            "pr": None,
+            "head": "a" * 40,
+            "base": None,
+            "check_id": 3,
+            "tag_object": "c" * 40,
+            "tag_ref": "refs/tags/release",
+        }
+        report = {
+            "repository": source["repository"],
+            "head": source["head"],
+            "base": None,
+            "version": 1,
+            "result": "pass",
+            "blocked": 0,
+            "suppressed": 0,
+            "commit_count": 2,
+        }
+        owned = {"id": 3, "head_sha": source["head"], "name": "TruffleHog secret scan", "app": {"id": 15368}}
+        module.github = lambda *args, method="GET", body=None: {**owned, **body} if method == "PATCH" else owned
+        self.assertEqual(module.publish(source, report)["conclusion"], "failure")
+        qualified = {
+            **report,
+            "tag_object": source["tag_object"],
+            "tag_ref_digest": hashlib.sha256(source["tag_ref"].encode()).hexdigest(),
+        }
+        self.assertEqual(module.publish(source, qualified)["conclusion"], "success")
 
 
 @unittest.skipUnless(
@@ -375,6 +710,149 @@ class NativeScannerTests(unittest.TestCase):
         policy.write_text(json.dumps({"version": 1, "exceptions": exceptions or []}))
         return gate().scan(repo, head, base, Path(os.environ["TRUFFLEHOG_BINARY"]), policy, "forlex-ai/unit", 60)
 
+    def test_annotated_tag_message_is_scanned_only_in_full_history_and_never_excepted(self):
+        """Current tag metadata blocks independently of commit-range fixture policy."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            self.git(repo, "init", "-q")
+            (repo / "README").write_text("clean source\n")
+            base = self.commit(repo)
+            raw = self.canary()
+            self.git(repo, "tag", "-a", "release", "-m", "TOKEN = " + raw)
+            tag = self.git(repo, "rev-parse", "refs/tags/release")
+            self.git(repo, "tag", "lightweight", base)
+            (repo / "README").write_text("clean updated source\n")
+            head = self.commit(repo)
+            rule = {**exception(finding(raw, path="@tag-metadata")), "commit": tag, "detector": "Github"}
+            delta = self.scan(root, repo, head, base, [rule])
+            self.assertEqual(delta["result"], "pass", json.dumps(delta))
+            self.assertFalse(any(row["source_kind"] == "tag_metadata" for row in delta["findings"]))
+            full = self.scan(root, repo, head, exceptions=[rule])
+            self.assertEqual(full["result"], "fail", json.dumps(full))
+            self.assertTrue(
+                any(row["source_kind"] == "tag_metadata" and row["commit"] == tag for row in full["findings"])
+            )
+            self.assertEqual(full["suppressed"], 0)
+            self.assertNotIn(raw, json.dumps(full))
+            payloads = root / "payloads"
+            payloads.mkdir()
+            _, commits = gate().git_range(repo, head, None)
+            index = gate().materialize(repo, commits, payloads, time.monotonic() + 60, include_tags=True)
+            tag_sources = [
+                source for sources in index.values() for source in sources if source["kind"] == "tag_metadata"
+            ]
+            self.assertEqual([source["commit"] for source in tag_sources], [tag])
+
+    def test_nested_annotated_tag_metadata_remains_scanned_after_inner_ref_is_deleted(self):
+        """Scan every tag object reachable through a current annotated tag ref."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            self.git(repo, "init", "-q")
+            (repo / "README").write_text("clean source\n")
+            head = self.commit(repo)
+            raw = self.canary()
+            self.git(repo, "tag", "-a", "inner", "-m", "TOKEN = " + raw)
+            inner = self.git(repo, "rev-parse", "refs/tags/inner")
+            self.git(repo, "tag", "-a", "outer", "inner", "-m", "Clean outer tag")
+            outer = self.git(repo, "rev-parse", "refs/tags/outer")
+            self.git(repo, "tag", "-d", "inner")
+            report = self.scan(root, repo, head)
+            self.assertEqual(report["result"], "fail", json.dumps(report))
+            self.assertTrue(
+                any(row["source_kind"] == "tag_metadata" and row["commit"] == inner for row in report["findings"])
+            )
+            self.assertNotIn(raw, json.dumps(report))
+            payloads = root / "payloads"
+            payloads.mkdir()
+            _, commits = gate().git_range(repo, head, None)
+            index = gate().materialize(repo, commits, payloads, time.monotonic() + 60, include_tags=True)
+            admitted = {
+                source["commit"] for sources in index.values() for source in sources if source["kind"] == "tag_metadata"
+            }
+            self.assertEqual(admitted, {inner, outer})
+
+    def test_pushed_tag_object_remains_bound_after_ref_moves_and_missing_object_refuses(self):
+        """Current clean metadata cannot replace an immutable pushed tag object."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            self.git(repo, "init", "-q")
+            (repo / "README").write_text("clean source\n")
+            head = self.commit(repo)
+            raw = self.canary()
+            self.git(repo, "tag", "-a", "release", "-m", "TOKEN = " + raw)
+            pushed = self.git(repo, "rev-parse", "refs/tags/release")
+            self.git(repo, "tag", "-f", "-a", "release", "-m", "Clean replacement")
+            policy = root / "policy.json"
+            policy.write_text('{"version":1,"exceptions":[]}')
+            self.assertEqual(self.scan(root, repo, head)["result"], "pass")
+
+            def pushed_scan():
+                return gate().scan(
+                    repo,
+                    head,
+                    None,
+                    Path(os.environ["TRUFFLEHOG_BINARY"]),
+                    policy,
+                    "forlex-ai/unit",
+                    60,
+                    tag_object=pushed,
+                    tag_ref="refs/tags/release",
+                )
+
+            report = pushed_scan()
+            self.assertEqual(report["result"], "fail", json.dumps(report))
+            self.assertEqual(report["tag_object"], pushed)
+            self.assertTrue(
+                any(row["source_kind"] == "tag_metadata" and row["commit"] == pushed for row in report["findings"])
+            )
+            self.assertNotIn(raw, json.dumps(report))
+            self.assertNotIn("refs/tags/release", json.dumps(report))
+            (repo / ".git" / "objects" / pushed[:2] / pushed[2:]).unlink()
+            self.assertEqual(pushed_scan()["result"], "error")
+
+    def test_lightweight_tag_push_is_commit_bound_and_invalid_tag_scope_refuses(self):
+        """Lightweight pushes scan commits without inventing annotated metadata."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            self.git(repo, "init", "-q")
+            (repo / "README").write_text("clean source\n")
+            first = self.commit(repo)
+            self.git(repo, "tag", "release", first)
+            (repo / "README").write_text("clean later source\n")
+            head = self.commit(repo)
+            policy = root / "policy.json"
+            policy.write_text('{"version":1,"exceptions":[]}')
+            module = gate()
+            scanner = Path(os.environ["TRUFFLEHOG_BINARY"])
+            report = module.scan(
+                repo, first, None, scanner, policy, "forlex-ai/unit", 60, tag_object=first, tag_ref="refs/tags/release"
+            )
+            self.assertEqual(report["result"], "pass", json.dumps(report))
+            self.assertFalse(any(row["source_kind"] == "tag_metadata" for row in report["findings"]))
+            payloads = root / "payloads"
+            payloads.mkdir()
+            _, commits = module.git_range(repo, first, None)
+            index = module.materialize(
+                repo, commits, payloads, time.monotonic() + 60, include_tags=True, tag_object=first, tag_head=first
+            )
+            self.assertFalse(any(source["kind"] == "tag_metadata" for sources in index.values() for source in sources))
+            mismatch = module.scan(
+                repo, head, None, scanner, policy, "forlex-ai/unit", 60, tag_object=first, tag_ref="refs/tags/release"
+            )
+            self.assertEqual(mismatch["result"], "error")
+            delta = module.scan(
+                repo, head, first, scanner, policy, "forlex-ai/unit", 60, tag_object=first, tag_ref="refs/tags/release"
+            )
+            self.assertEqual(delta["result"], "error")
+
     def test_merge_only_resolution_is_scanned(self):
         """Detect a secret present only in the resolved merge commit."""
         with tempfile.TemporaryDirectory() as directory:
@@ -395,12 +873,12 @@ class NativeScannerTests(unittest.TestCase):
             merged = subprocess.run(
                 [
                     "git",
+                    "-C",
+                    str(repo),
                     "-c",
                     "user.name=Unit",
                     "-c",
                     "user.email=unit@example.invalid",
-                    "-C",
-                    str(repo),
                     "merge",
                     "side",
                     "--no-commit",

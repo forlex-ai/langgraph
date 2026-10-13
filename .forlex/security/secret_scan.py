@@ -110,7 +110,7 @@ def classify(row, exceptions, repository):
     fingerprint = hashlib.sha256(raw.encode()).hexdigest()
     exception_id = None
     kind = source.get("kind", "file_content")
-    if kind not in {"file_content", "filename", "commit_metadata"}:
+    if kind not in {"file_content", "filename", "commit_metadata", "tag_metadata"}:
         raise SecretScanRefusal("unknown source kind")
     if not verified and kind == "file_content":
         for rule in exceptions:
@@ -170,7 +170,7 @@ def git_range(repo, head, base):
     return effective, commits
 
 
-def materialize(repo, commits, directory, deadline):
+def materialize(repo, commits, directory, deadline, *, include_tags=False, tag_object=None, tag_head=None):
     """Enumerate every changed Git blob and materialize inert, deduplicated data.
 
     Returns:
@@ -234,6 +234,39 @@ def materialize(repo, commits, directory, deadline):
             if mode not in {b"100644", b"100755", b"120000"}:
                 raise SecretScanRefusal("unsupported Git object mode")
             add(("blob", object_id.decode("ascii")), source)
+
+    if tag_object is not None and not include_tags:
+        raise SecretScanRefusal("pushed tag requires full-history admission")
+    if include_tags:
+        references = []
+        visited = set()
+        for row in git("for-each-ref", "--format=%(objectname) %(objecttype)", "refs/tags").splitlines():
+            fields = row.decode("ascii").split()
+            if len(fields) != 2 or not SHA.fullmatch(fields[0]) or fields[1] not in {"tag", "commit", "tree", "blob"}:
+                raise SecretScanRefusal("invalid tag reference")
+            references.append(fields)
+        if tag_object is not None:
+            if not SHA.fullmatch(tag_object) or not isinstance(tag_head, str) or not SHA.fullmatch(tag_head):
+                raise SecretScanRefusal("invalid pushed tag binding")
+            if git("rev-parse", tag_object + "^{commit}").strip().decode("ascii") != tag_head:
+                raise SecretScanRefusal("pushed tag commit identity mismatch")
+            references.append((tag_object, git("cat-file", "-t", tag_object).strip().decode("ascii")))
+        for object_id, kind in references:
+            depth = 0
+            while kind == "tag" and object_id not in visited:
+                depth += 1
+                if depth > 64:
+                    raise SecretScanRefusal("tag nesting limit exceeded")
+                visited.add(object_id)
+                add(("tag", object_id), {"commit": object_id, "file": "@tag-metadata", "kind": "tag_metadata"})
+                headers = git("cat-file", "tag", object_id).partition(b"\n\n")[0].splitlines()
+                if len(headers) < 3 or not headers[0].startswith(b"object ") or not headers[1].startswith(b"type "):
+                    raise SecretScanRefusal("invalid annotated tag object")
+                object_id, kind = headers[0][7:].decode("ascii"), headers[1][5:].decode("ascii")
+                if not SHA.fullmatch(object_id) or kind not in {"tag", "commit", "tree", "blob"}:
+                    raise SecretScanRefusal("invalid tag target")
+                if git("cat-file", "-t", object_id).strip().decode("ascii") != kind:
+                    raise SecretScanRefusal("tag target identity mismatch")
 
     objects = [(key, value) for key, value in payloads.items() if key[0] != "filename"]
     request = directory.parent / "git-object-request"
@@ -303,7 +336,7 @@ def validate_diagnostics(path):
                 raise SecretScanRefusal("scanner reported incomplete detection")
 
 
-def scan(repo, head, base, scanner, policy, repository, timeout):
+def scan(repo, head, base, scanner, policy, repository, timeout, *, tag_object=None, tag_ref=None):
     """Run the pinned scanner without credentials and redact its complete output.
 
     Returns:
@@ -314,6 +347,20 @@ def scan(repo, head, base, scanner, policy, repository, timeout):
     """
     report = {"version": 1, "repository": repository, "head": head, "base": base, "result": "error", "findings": []}
     try:
+        if tag_object is not None:
+            if (
+                not isinstance(tag_object, str)
+                or not SHA.fullmatch(tag_object)
+                or not isinstance(tag_ref, str)
+                or not tag_ref.startswith("refs/tags/")
+                or base is not None
+            ):
+                raise SecretScanRefusal("invalid pushed tag source")
+            report.update(
+                {"tag_object": tag_object, "tag_ref_digest": hashlib.sha256(os.fsencode(tag_ref)).hexdigest()}
+            )
+        elif tag_ref is not None:
+            raise SecretScanRefusal("incomplete pushed tag source")
         exceptions = read_policy(policy)
         effective, commits = git_range(repo, head, base)
         report.update({"effective_base": effective, "commit_count": len(commits)})
@@ -334,7 +381,15 @@ def scan(repo, head, base, scanner, policy, repository, timeout):
             deadline = time.monotonic() + timeout
             payload_directory = directory / "payloads"
             payload_directory.mkdir(mode=0o700)
-            index = materialize(repo, commits, payload_directory, deadline)
+            index = materialize(
+                repo,
+                commits,
+                payload_directory,
+                deadline,
+                include_tags=base is None,
+                tag_object=tag_object,
+                tag_head=head,
+            )
             report["payload_count"] = len(index)
             command.append(str(payload_directory))
             environment = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(directory), "LANG": "C.UTF-8"}
@@ -429,6 +484,7 @@ def context(event, kind, repository, pr_number=0):
     if event.get("repository", {}).get("full_name") != repository:
         raise SecretScanRefusal("event repository mismatch")
     number = event.get("number") if kind == "pull_request_target" else pr_number
+    tag_object, tag_ref = None, None
     if number:
         if not isinstance(number, int) or number < 1:
             raise SecretScanRefusal("invalid PR")
@@ -444,11 +500,18 @@ def context(event, kind, repository, pr_number=0):
     else:
         head = os.environ["GITHUB_SHA"]
         base = event.get("before") if kind == "push" else None
+        if kind == "push" and event.get("ref", "").startswith("refs/tags/"):
+            tag_object, tag_ref = event.get("after"), event["ref"]
+            if not isinstance(tag_object, str) or not SHA.fullmatch(tag_object) or tag_object == "0" * 40:
+                raise SecretScanRefusal("pushed tag object unavailable")
+            base = None
         if base == "0" * 40:
             base = None
     if not SHA.fullmatch(head) or (base is not None and not SHA.fullmatch(base)):
         raise SecretScanRefusal("invalid source identity")
     result = {"repository": repository, "pr": number or None, "head": head, "base": base}
+    if tag_object is not None:
+        result.update({"tag_object": tag_object, "tag_ref": tag_ref})
     created = github(
         repository, "check-runs", method="POST", body={"name": CHECK_NAME, "head_sha": head, "status": "in_progress"}
     )
@@ -466,17 +529,29 @@ def publish(source, report):
         SecretScanRefusal: Invalid or incomplete evidence; scan captures this as an error report.
     """
     repository = source["repository"]
+    current_context = True
     if source["pr"]:
-        current = github(repository, "pulls/" + str(source["pr"]))
-        if current["state"] != "open" or (current["head"]["sha"], current["base"]["sha"]) != (
-            source["head"],
-            source["base"],
-        ):
-            raise SecretScanRefusal("PR context changed; a fresh scan is required")
+        try:
+            current = github(repository, "pulls/" + str(source["pr"]))
+            current_context = current["state"] == "open" and (current["head"]["sha"], current["base"]["sha"]) == (
+                source["head"],
+                source["base"],
+            )
+        except (KeyError, TypeError, ValueError, OSError):
+            current_context = False
     counts = (report.get("blocked"), report.get("suppressed"), report.get("commit_count"))
     complete = all(type(value) is int and value >= 0 for value in counts)
+    tag_matches = report.get("tag_object") == source.get("tag_object") and (
+        source.get("tag_object") is None
+        or (
+            isinstance(source.get("tag_ref"), str)
+            and report.get("tag_ref_digest") == hashlib.sha256(os.fsencode(source["tag_ref"])).hexdigest()
+        )
+    )
     success = (
-        complete
+        current_context
+        and complete
+        and tag_matches
         and report.get("blocked") == 0
         and report.get("version") == 1
         and not report.get("error")
@@ -484,20 +559,46 @@ def publish(source, report):
         and (report.get("head"), report.get("base"), report.get("repository"))
         == (source["head"], source["base"], repository)
     )
-    check = github(repository, "check-runs/" + str(source["check_id"]))
-    if check["head_sha"] != source["head"] or check["name"] != CHECK_NAME or check["app"]["id"] != 15368:
+
+    def owned(check):
+        return (
+            isinstance(check, dict)
+            and type(check.get("id")) is int
+            and type(source["check_id"]) is int
+            and check["id"] == source["check_id"]
+            and check.get("head_sha") == source["head"]
+            and check.get("name") == CHECK_NAME
+            and isinstance(check.get("app"), dict)
+            and check["app"].get("id") == 15368
+        )
+
+    try:
+        check = github(repository, "check-runs/" + str(source["check_id"]))
+    except (KeyError, TypeError, ValueError, OSError):
+        raise SecretScanRefusal("check identity verification unavailable") from None
+    if not owned(check):
         raise SecretScanRefusal("check identity mismatch")
-    summary = f"Result: {'pass' if success else 'failure'}. Scanned commits: {report.get('commit_count', 'unavailable')}. Blocking detections: {report.get('blocked', 'unavailable')}. Exact fixture exceptions: {report.get('suppressed', 0)}. Raw secrets and verification responses are never published."
-    return github(
-        repository,
-        "check-runs/" + str(source["check_id"]),
-        method="PATCH",
-        body={
-            "status": "completed",
-            "conclusion": "success" if success else "failure",
-            "output": {"title": CHECK_NAME, "summary": summary},
-        },
-    )
+    blocked, suppressed, commits = (value if type(value) is int and value >= 0 else "unavailable" for value in counts)
+    summary = f"Result: {'pass' if success else 'failure'}. Scanned commits: {commits}. Blocking detections: {blocked}. Exact fixture exceptions: {suppressed}. Raw secrets and verification responses are never published."
+    if not current_context:
+        summary += " Current PR context changed or could not be verified; a fresh scan is required."
+    conclusion = "success" if success else "failure"
+    try:
+        result = github(
+            repository,
+            "check-runs/" + str(source["check_id"]),
+            method="PATCH",
+            body={
+                "status": "completed",
+                "conclusion": conclusion,
+                "output": {"title": CHECK_NAME, "summary": summary},
+            },
+        )
+    except (KeyError, TypeError, ValueError, OSError):
+        raise SecretScanRefusal("check completion unavailable") from None
+    if not owned(result) or result.get("status") != "completed" or result.get("conclusion") != conclusion:
+        raise SecretScanRefusal("check completion was not confirmed")
+    return result
 
 
 def main():
@@ -508,6 +609,8 @@ def main():
     """
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
+    validate = sub.add_parser("validate-policy")
+    validate.add_argument("--policy", type=Path, required=True)
     prepare = sub.add_parser("context")
     prepare.add_argument("--event", type=Path, required=True)
     prepare.add_argument("--kind", required=True)
@@ -526,21 +629,38 @@ def main():
     finish.add_argument("--report", type=Path, required=True)
     args = parser.parse_args()
     try:
-        if args.command == "context":
+        if args.command == "validate-policy":
+            read_policy(args.policy)
+        elif args.command == "context":
             result = context(strict_json(args.event.read_text()), args.kind, args.repository, args.pr)
             args.output.write_text(json.dumps(result) + "\n")
             with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
                 stream.write("head=" + result["head"] + "\n")
+                if result.get("tag_object") is not None:
+                    stream.write("tag_object=" + result["tag_object"] + "\n")
         elif args.command == "scan":
             source = strict_json(args.context.read_text())
             report = scan(
-                args.repo, source["head"], source["base"], args.scanner, args.policy, source["repository"], args.timeout
+                args.repo,
+                source["head"],
+                source["base"],
+                args.scanner,
+                args.policy,
+                source["repository"],
+                args.timeout,
+                tag_object=source.get("tag_object"),
+                tag_ref=source.get("tag_ref"),
             )
             args.output.write_text(json.dumps(report, indent=2) + "\n")
             return 0 if report["result"] == "pass" else 1
         else:
             source = strict_json(args.context.read_text())
-            report = strict_json(args.report.read_text()) if args.report.exists() else {"result": "error"}
+            try:
+                report = strict_json(args.report.read_text())
+            except (ValueError, OSError, TypeError):
+                report = {"result": "error"}
+            if not isinstance(report, dict):
+                report = {"result": "error"}
             result = publish(source, report)
             return 0 if result["conclusion"] == "success" else 1
     except (KeyError, ValueError, OSError, TypeError):
